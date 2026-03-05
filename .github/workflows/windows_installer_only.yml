@@ -1,0 +1,142 @@
+name: Build_windows_installer_only
+
+on:
+  workflow_dispatch:
+    inputs:
+      dependency_release_tag:
+        description: "Dependency source release tag (latest or e.g. v8.9.2)"
+        required: false
+        default: "latest"
+      mark_as_gh_build:
+        description: "Modify resource.h version text to Notepad++ GH_BUILD"
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  build_windows_installer:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v6
+
+    - name: Add msbuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Install NSIS
+      run: choco install nsis -y --no-progress
+
+    - name: Modify resource.h N++ version to avoid confusion
+      if: ${{ inputs.mark_as_gh_build }}
+      working-directory: PowerEditor\src\
+      run: |
+        $content = Get-Content -Path 'resource.h'
+        $newContent = $content -replace 'TEXT\(\"Notepad\+\+ v.*\"\)', 'TEXT("Notepad++ GH_BUILD")'
+        $newContent | Set-Content -Path 'resource.h'
+
+    - name: Build Notepad++ x64 Release
+      working-directory: PowerEditor\visual.net\
+      run: msbuild notepadPlus.sln /m /p:configuration="Release" /p:platform="x64" /p:PlatformToolset="v143"
+
+    - name: Prepare shared files for NSIS
+      run: |
+        New-Item -ItemType Directory -Path PowerEditor\bin -Force | Out-Null
+        Copy-Item PowerEditor\src\langs.model.xml PowerEditor\bin\langs.model.xml -Force
+        Copy-Item PowerEditor\src\stylers.model.xml PowerEditor\bin\stylers.model.xml -Force
+        Copy-Item PowerEditor\src\shortcuts.xml PowerEditor\bin\shortcuts.xml -Force
+        Copy-Item PowerEditor\src\contextMenu.xml PowerEditor\bin\contextMenu.xml -Force
+
+    - name: Stage installer dependencies from official release
+      run: |
+        $releaseTag = "${{ inputs.dependency_release_tag }}"
+        $apiBase = "https://api.github.com/repos/notepad-plus-plus/notepad-plus-plus/releases"
+        $releaseApi = if ($releaseTag -eq "latest") { "$apiBase/latest" } else { "$apiBase/tags/$releaseTag" }
+        $release = Invoke-RestMethod -Uri $releaseApi
+        $asset = $release.assets | Where-Object { $_.name -match '\.Installer\.x64\.exe$' } | Select-Object -First 1
+        if (-not $asset) {
+          throw "No x64 installer asset found in release '$releaseTag'."
+        }
+
+        $installerPath = Join-Path $env:RUNNER_TEMP "npp_dependency_installer_x64.exe"
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installerPath
+
+        $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+        if (-not $sevenZip) {
+          $sevenZip = "${env:ProgramFiles}\7-Zip\7z.exe"
+        }
+        if (-not (Test-Path $sevenZip)) {
+          throw "7z.exe was not found."
+        }
+
+        $extractDir = Join-Path $env:RUNNER_TEMP "npp_dependency_installer_x64"
+        New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+        & $sevenZip x $installerPath "-o$extractDir" -y | Out-Null
+        if ($LastExitCode -ne 0) {
+          throw "Failed to extract dependency installer."
+        }
+
+        function Get-RequiredFile {
+          param(
+            [Parameter(Mandatory=$true)][string]$Name,
+            [string]$PathRegex = ""
+          )
+          $files = Get-ChildItem -Path $extractDir -Recurse -File -Filter $Name
+          if ($PathRegex -ne "") {
+            $files = $files | Where-Object { $_.FullName -match $PathRegex }
+          }
+          if (-not $files) {
+            throw "Required file '$Name' was not found in extracted dependency installer."
+          }
+          return $files[0].FullName
+        }
+
+        New-Item -ItemType Directory -Path PowerEditor\bin64\plugins\NppExport -Force | Out-Null
+        New-Item -ItemType Directory -Path PowerEditor\bin64\plugins\mimeTools -Force | Out-Null
+        New-Item -ItemType Directory -Path PowerEditor\bin64\plugins\NppConverter -Force | Out-Null
+        New-Item -ItemType Directory -Path PowerEditor\bin64\plugins\Config -Force | Out-Null
+        New-Item -ItemType Directory -Path PowerEditor\bin64\updater -Force | Out-Null
+        New-Item -ItemType Directory -Path PowerEditor\bin\updater\translations -Force | Out-Null
+
+        Copy-Item (Get-RequiredFile -Name "NppExport.dll") PowerEditor\bin64\plugins\NppExport\NppExport.dll -Force
+        Copy-Item (Get-RequiredFile -Name "mimeTools.dll") PowerEditor\bin64\plugins\mimeTools\mimeTools.dll -Force
+        Copy-Item (Get-RequiredFile -Name "NppConverter.dll") PowerEditor\bin64\plugins\NppConverter\NppConverter.dll -Force
+        Copy-Item (Get-RequiredFile -Name "nppPluginList.dll") PowerEditor\bin64\plugins\Config\nppPluginList.dll -Force
+
+        Copy-Item (Get-RequiredFile -Name "GUP.exe") PowerEditor\bin64\updater\GUP.exe -Force
+        Copy-Item (Get-RequiredFile -Name "gup.xml") PowerEditor\bin64\updater\gup.xml -Force
+        Copy-Item (Get-RequiredFile -Name "LICENSE" -PathRegex 'updater\\LICENSE$') PowerEditor\bin64\updater\LICENSE -Force
+        Copy-Item (Get-RequiredFile -Name "README.md" -PathRegex 'updater\\README\.md$') PowerEditor\bin64\updater\README.md -Force
+        Copy-Item (Get-RequiredFile -Name "updater.ico") PowerEditor\bin64\updater\updater.ico -Force
+
+        Copy-Item (Get-RequiredFile -Name "NppShell.msix") PowerEditor\bin64\NppShell.msix -Force
+        Copy-Item (Get-RequiredFile -Name "NppShell.dll" -PathRegex 'contextMenu\\NppShell\.dll$') PowerEditor\bin64\NppShell.x64.dll -Force
+
+        $gupLocalization = Get-ChildItem -Path $extractDir -Recurse -Directory | Where-Object { $_.Name -eq "gupLocalization" } | Select-Object -First 1
+        if (-not $gupLocalization) {
+          throw "gupLocalization directory was not found in extracted dependency installer."
+        }
+        Copy-Item (Join-Path $gupLocalization.FullName "*.xml") PowerEditor\bin\updater\translations\ -Force
+
+    - name: Build x64 installer with NSIS
+      working-directory: PowerEditor\installer\
+      run: |
+        New-Item -ItemType Directory -Path .\build -Force | Out-Null
+        $makensis = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+        if (-not $makensis) {
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+        }
+        if (-not (Test-Path $makensis)) {
+          throw "makensis.exe was not found."
+        }
+        & $makensis -DARCH64 nppSetup.nsi
+        if ($LastExitCode -ne 0) {
+          throw "NSIS build failed."
+        }
+
+    - name: Upload installer artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: Notepad++.Installer.x64
+        path: PowerEditor\installer\build\npp.*.Installer.x64.exe
+        if-no-files-found: error
